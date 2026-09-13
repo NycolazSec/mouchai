@@ -16,6 +16,7 @@ neurones activés (le "langage" de la mouche) traduite en comportement.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import unicodedata
 from collections import defaultdict
@@ -24,6 +25,8 @@ from dataclasses import dataclass
 import numpy as np
 
 import memoire
+import physiologie
+import semantique
 
 # Mots vides ignorés lors de l'apprentissage de vocabulaire (on ne veut retenir
 # que des mots porteurs de sens, pas des articles/pronoms).
@@ -89,6 +92,160 @@ def _correspond(mot_utilisateur: str, mot_connu: str) -> bool:
 # {categorie: {mot: nb_confirmations}}.
 _LEXIQUE_APPRIS: dict[str, dict[str, int]] = memoire.charger_lexique_appris()
 
+# Statistiques mot/catégorie alimentées automatiquement à chaque échange
+# (apprentissage par co-occurrence, sans attendre un 👍) et utilisées comme
+# classifieur bayésien naïf : {categorie: {mot: poids}}.
+_STATS_MOTS: dict[str, dict[str, float]] = memoire.charger_stats_mots()
+
+MAX_VOCABULAIRE_PAR_CATEGORIE = 3000
+
+
+def score_bayesien(tokens: list[str]) -> dict[str, float]:
+    """Classifieur bayésien naïf maison sur les co-occurrences accumulées.
+    Contrairement au lexique (correspondance de mots), il généralise : un mot
+    jamais confirmé mais souvent croisé dans des phrases d'une catégorie finit
+    par peser en sa faveur. Lissage de Laplace pour les mots rares."""
+    scores: dict[str, float] = {}
+    if not _STATS_MOTS:
+        return scores
+
+    vocabulaire = {mot for mots in _STATS_MOTS.values() for mot in mots}
+    taille_vocab = len(vocabulaire) or 1
+
+    # Seuls les mots déjà rencontrés sont notés. Sinon, le lissage donne
+    # mécaniquement l'avantage à la catégorie la moins entraînée (probabilité
+    # plus forte pour un mot inconnu), et une phrase de mots inconnus élit la
+    # catégorie la plus pauvre — exactement l'inverse du comportement voulu.
+    tokens_connus = [t for t in tokens if t in vocabulaire]
+    if not tokens_connus:
+        return {}
+
+    # Prior uniforme volontairement : la fréquence d'entraînement d'une
+    # catégorie est ici un artefact d'usage, pas une probabilité a priori.
+    for categorie, mots in _STATS_MOTS.items():
+        total_categorie = sum(mots.values()) or 1.0
+        score = 0.0
+        for token in tokens_connus:
+            poids = mots.get(token, 0.0)
+            score += math.log((poids + 0.3) / (total_categorie + 0.3 * taille_vocab))
+        scores[categorie] = score
+    return scores
+
+
+def _mots_du_lexique_de_base() -> dict[str, str]:
+    return {
+        mot: categorie
+        for categorie, lexique in LEXIQUE_INTENTIONS.items()
+        for mot in lexique
+    }
+
+
+def purger_conflits_lexique() -> int:
+    """Supprime des co-occurrences apprises les mots qui appartiennent au
+    lexique de base d'une AUTRE catégorie. Sans ça, une erreur de
+    classification pouvait enregistrer « peur » du côté de la parade, et le
+    classifieur verrouillait ensuite l'erreur définitivement."""
+    base = _mots_du_lexique_de_base()
+    supprimes = 0
+    for categorie, mots in _STATS_MOTS.items():
+        for mot in list(mots):
+            if base.get(mot, categorie) != categorie:
+                del mots[mot]
+                supprimes += 1
+    for categorie, lexique in _LEXIQUE_APPRIS.items():
+        for mot in list(lexique):
+            if base.get(mot, categorie) != categorie:
+                del lexique[mot]
+                supprimes += 1
+    return supprimes
+
+
+def apprendre_cooccurrence(message: str, categorie: str, force: float = 0.5) -> list[str]:
+    """Apprentissage rapide : quand la catégorie d'un message est établie avec
+    certitude (mot du lexique reconnu), tous les autres mots porteurs de sens
+    de la phrase gagnent du crédit pour cette catégorie — sans attendre un 👍.
+    C'est de la propagation d'étiquette par co-occurrence : une seule phrase
+    « attention le chat arrive » suffit à rapprocher « chat » du danger.
+    Renvoie les mots réellement découverts (inconnus jusqu'ici)."""
+    base = _mots_du_lexique_de_base()
+    # Un mot du lexique de base ne se réapprend jamais ailleurs : c'est la
+    # seule vérité terrain dont dispose la mouche.
+    mots = [
+        m for m in mots_candidats_apprentissage(message)
+        if base.get(m, categorie) == categorie
+    ]
+    if not mots:
+        return []
+
+    stats = _STATS_MOTS.setdefault(categorie, {})
+    connus = {mot for m in _STATS_MOTS.values() for mot in m}
+    nouveaux = [mot for mot in mots if mot not in connus]
+
+    for mot in mots:
+        stats[mot] = stats.get(mot, 0.0) + force
+
+    if len(stats) > MAX_VOCABULAIRE_PAR_CATEGORIE:
+        gardes = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)
+        _STATS_MOTS[categorie] = dict(gardes[:MAX_VOCABULAIRE_PAR_CATEGORIE])
+
+    return nouveaux
+
+
+def categorie_connue(mot: str) -> str | None:
+    """Catégorie déjà associée à un mot, tous mécanismes confondus."""
+    for categorie, lexique in LEXIQUE_INTENTIONS.items():
+        if mot in lexique:
+            return categorie
+    for categorie, lexique in _LEXIQUE_APPRIS.items():
+        if mot in lexique:
+            return categorie
+    meilleure, poids_max = None, 0.0
+    for categorie, mots in _STATS_MOTS.items():
+        poids = mots.get(mot, 0.0)
+        if poids > poids_max:
+            meilleure, poids_max = categorie, poids
+    return meilleure
+
+
+def est_totalement_inconnu(mot: str) -> bool:
+    """Vrai si le mot n'est ni au lexique, ni dans les co-occurrences, ni
+    plaçable dans l'espace sémantique. Dans ce cas la mouche ne devine pas :
+    elle le dit et demande — ça vaut mieux qu'une réaction au hasard, et ça
+    accélère l'apprentissage."""
+    if categorie_connue(mot) is not None:
+        return False
+    corpus = memoire.charger_corpus()
+    return mot not in semantique.modele(corpus)
+
+
+def voisinages_semantiques(tokens: list[str]) -> list[tuple[str, str, str, float]]:
+    """Pour chaque mot dont la mouche ignore tout, cherche ses plus proches
+    voisins dans l'espace sémantique appris et lui fait hériter de leur
+    catégorie. Renvoie (mot, categorie, voisin, proximité)."""
+    corpus = memoire.charger_corpus()
+    if len(corpus) < 6:
+        return []
+
+    connus = {
+        mot
+        for lexique in LEXIQUE_INTENTIONS.values()
+        for mot in lexique
+    }
+    connus |= {mot for lex in _LEXIQUE_APPRIS.values() for mot in lex}
+    connus |= {mot for stats in _STATS_MOTS.values() for mot in stats}
+    if not connus:
+        return []
+
+    resultats = []
+    for token in tokens:
+        if token in connus or len(token) < 3 or token in MOTS_VIDES:
+            continue
+        for proche, proximite in semantique.voisins(token, corpus, candidats=connus, k=2):
+            categorie = categorie_connue(proche)
+            if categorie:
+                resultats.append((token, categorie, proche, proximite))
+    return resultats
+
 
 def detecter_intention(message: str) -> tuple[str | None, list[str]]:
     """Analyse le sens du message pour deviner l'intention de l'utilisateur
@@ -96,7 +253,10 @@ def detecter_intention(message: str) -> tuple[str | None, list[str]]:
     précise (phéromone, nourriture, danger) plutôt qu'un bruit aléatoire.
     Combine le lexique de base et le vocabulaire appris par renforcement, avec
     tolérance aux variantes morphologiques (voir _correspond).
-    Renvoie (catégorie ou None, mots reconnus)."""
+    Renvoie (catégorie ou None, mots reconnus, certitude issue du lexique de
+    base). La certitude conditionne l'apprentissage automatique : on ne
+    propage une étiquette que depuis une décision fiable, jamais depuis une
+    déduction statistique — sinon les erreurs se renforcent elles-mêmes."""
     tokens = re.findall(r"[a-zàâäéèêëïîôöùûüçñ']+", _sans_accents(message.lower()))
     # defaultdict : le vocabulaire appris peut couvrir des catégories absentes
     # du lexique de base (ex. "neutre", jamais dans LEXIQUE_INTENTIONS) — un
@@ -104,13 +264,18 @@ def detecter_intention(message: str) -> tuple[str | None, list[str]]:
     scores: dict[str, float] = defaultdict(float, {cat: 0.0 for cat in LEXIQUE_INTENTIONS})
     mots_reconnus: list[str] = []
 
+    certitude_lexique = False
     for token in tokens:
         reconnu = False
 
         for categorie, lexique in LEXIQUE_INTENTIONS.items():
             if any(_correspond(token, mot) for mot in lexique):
-                scores[categorie] += 1.0
+                # Le lexique de base est la vérité terrain : il pèse plus lourd
+                # que tout ce qui est appris statistiquement (≤1.2) ou déduit
+                # par le bayésien (≤0.95), qui eux peuvent être bruités.
+                scores[categorie] += 2.5
                 reconnu = True
+                certitude_lexique = True
 
         for categorie, lexique_appris in _LEXIQUE_APPRIS.items():
             mot_proche = next((m for m in lexique_appris if _correspond(token, m)), None)
@@ -124,10 +289,30 @@ def detecter_intention(message: str) -> tuple[str | None, list[str]]:
         if reconnu:
             mots_reconnus.append(token)
 
+    # Généralisation sémantique : les mots inconnus héritent de la réaction de
+    # leurs voisins dans l'espace appris (voir semantique.py). C'est ce qui
+    # permet de réagir correctement à un mot jamais enseigné.
+    for token, categorie, proche, proximite in voisinages_semantiques(tokens):
+        scores[categorie] += 0.8 * proximite
+        mots_reconnus.append(f"{token}~{proche}")
+
+    # Apport du classifieur bayésien : il ne peut pas décider seul (sinon le
+    # moindre bruit statistique l'emporterait), mais il départage et permet de
+    # trancher sur des phrases dont aucun mot n'est explicitement au lexique.
+    bayes = score_bayesien(tokens)
+    if bayes:
+        meilleur_bayes = max(bayes, key=bayes.get)
+        second = sorted(bayes.values(), reverse=True)
+        marge = (second[0] - second[1]) if len(second) > 1 else 0.0
+        # Marge normalisée : plus le bayésien est tranché, plus il pèse. Le
+        # plafond reste sous le poids d'un mot du lexique de base (1.0), qui
+        # garde donc le dernier mot en cas de conflit.
+        scores[meilleur_bayes] += min(0.95, marge / 3.0)
+
     meilleure_categorie = max(scores, key=scores.get)
-    if scores[meilleure_categorie] == 0:
-        return None, []
-    return meilleure_categorie, mots_reconnus
+    if scores[meilleure_categorie] <= 0:
+        return None, [], False
+    return meilleure_categorie, mots_reconnus, certitude_lexique
 
 
 def mots_candidats_apprentissage(message: str) -> list[str]:
@@ -205,7 +390,9 @@ class TraceActivation:
     compartiment_gagnant: str
     intensite: float
     intention_detectee: str | None
+    certitude_lexique: bool
     mots_reconnus: list[str]
+    voisins_semantiques: list[tuple[str, str, str, float]]
 
     def langage_mouche(self) -> str:
         """Formate la trace neuronale comme une phrase dans le "langage" natif
@@ -278,15 +465,24 @@ def recharger_depuis_memoire() -> None:
     """Recharge poids synaptiques appris et lexique appris depuis la mémoire
     persistante, à chaud (après un import ou une réinitialisation), sans avoir
     à redémarrer le serveur."""
-    global _W_MBON_KC, _LEXIQUE_APPRIS
+    global _W_MBON_KC, _LEXIQUE_APPRIS, _STATS_MOTS
     _W_MBON_KC = _construire_poids_mbon_kc_base()
     _appliquer_overrides_poids()
     _LEXIQUE_APPRIS = memoire.charger_lexique_appris()
+    _STATS_MOTS = memoire.charger_stats_mots()
+    purger_conflits_lexique()
 
 
-def simuler_stimulus(message: str) -> TraceActivation:
+def stats_mots_actuelles() -> dict[str, dict[str, float]]:
+    """Expose l'état courant des co-occurrences pour persistance."""
+    return _STATS_MOTS
+
+
+def simuler_stimulus(message: str, etat_interne: dict | None = None) -> TraceActivation:
     """Propage le message (comme une odeur) à travers le circuit simplifié et
-    renvoie la trace complète d'activation, étage par étage."""
+    renvoie la trace complète d'activation, étage par étage. `etat_interne`
+    (faim, énergie) module les sorties, comme la physiologie module les
+    comportements d'une vraie drosophile."""
     rng = np.random.default_rng(_seed_depuis_texte(message))
 
     # Chaque mot du message est haché vers un récepteur olfactif précis (comme
@@ -319,10 +515,23 @@ def simuler_stimulus(message: str) -> TraceActivation:
     # présente au circuit la "vraie" odeur associée à cette intention (comme
     # une phéromone identifiée), ce qui force le compartiment MBON correspondant
     # à dominer — la mouche répond alors bien au SENS du message, pas au hasard.
-    intention_detectee, mots_reconnus = detecter_intention(message)
+    intention_detectee, mots_reconnus, certitude = detecter_intention(message)
     if intention_detectee is not None:
         nom_compartiment = _NOM_PAR_CATEGORIE[intention_detectee]
-        mbon_scores[nom_compartiment] += 3.0
+        # Le bonus doit garantir la victoire du sens détecté : avec un bonus
+        # fixe, un compartiment dont les synapses ont beaucoup été renforcées
+        # finissait par passer devant, et un mot aussi explicite que « peur »
+        # pouvait déclencher une parade nuptiale.
+        ecart = max(mbon_scores.values()) - mbon_scores[nom_compartiment]
+        mbon_scores[nom_compartiment] += max(3.0, ecart + 1.5)
+
+    # Modulation par l'état interne : affamée, elle penche vers la nourriture ;
+    # épuisée, elle abandonne la parade. Un même message ne donne donc pas
+    # toujours la même réaction.
+    if etat_interne:
+        for categorie, biais in physiologie.modulation(etat_interne).items():
+            if biais:
+                mbon_scores[_NOM_PAR_CATEGORIE[categorie]] += biais
 
     # Le compartiment MBON le plus activé détermine le comportement de sortie
     nom_gagnant = max(mbon_scores, key=mbon_scores.get)
@@ -338,7 +547,11 @@ def simuler_stimulus(message: str) -> TraceActivation:
         compartiment_gagnant=categorie_gagnante,
         intensite=intensite,
         intention_detectee=intention_detectee,
-        mots_reconnus=mots_reconnus,
+        certitude_lexique=certitude,
+        mots_reconnus=[m for m in mots_reconnus if "~" not in m],
+        voisins_semantiques=voisinages_semantiques(
+            re.findall(r"[a-zàâäéèêëïîôöùûüçñ']+", _sans_accents(message.lower()))
+        ),
     )
 
 

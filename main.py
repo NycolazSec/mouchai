@@ -3,16 +3,20 @@ import random
 import struct
 import wave
 
+import langage
 import memoire
+import physiologie
 from fly_animation import generer_video_reaction
 from fly_brain import (
     appliquer_feedback_sur_echange,
+    apprendre_cooccurrence,
     comportement_depuis_trace,
     enseigner_mot,
+    est_totalement_inconnu,
     recharger_depuis_memoire,
     simuler_stimulus,
+    stats_mots_actuelles,
 )
-from texte_genere import generer_phrase
 
 SAMPLE_RATE = 44100  # 44.1 kHz standard
 
@@ -111,29 +115,72 @@ def converser_avec_mouche(
     message_humain: str,
     nom_fichier_wav: str = "reponse_mouche.wav",
     nom_fichier_video: str | None = None,
+    mode: str = "reflechi",
 ) -> dict:
     """Fait "parler" la mouche : propage le message dans le circuit neuronal
-    simulé (fly_brain), en tire un comportement, synthétise le signal audio
-    correspondant, et génère une courte vidéo de sa réaction physique.
-    Renvoie un dict prêt à être affiché ou renvoyé en JSON."""
-    trace = simuler_stimulus(message_humain)
+    simulé (fly_brain), en tire un comportement, compose une vraie réponse en
+    phrases (langage.py), synthétise le son et la vidéo de réaction.
+
+    `mode` vaut "rapide" (une seule réponse candidate, pas de rappel mémoire)
+    ou "reflechi" (recherche dans l'historique + plusieurs candidats départagés)."""
+    etat_interne = physiologie.faire_deriver(memoire.charger_etat_interne())
+    trace = simuler_stimulus(message_humain, etat_interne=etat_interne)
     reponse = comportement_depuis_trace(trace)
 
     audio = synthetiser_audio(reponse)
     exporter_wav(nom_fichier_wav, audio)
 
-    message_mouche = reponse["message"]
+    # Apprentissage rapide : dès que la catégorie est établie par un mot connu,
+    # les autres mots de la phrase gagnent du crédit pour cette catégorie.
+    # Uniquement depuis une décision fiable (mot du lexique de base) : propager
+    # une étiquette issue d'une déduction statistique ferait se renforcer les
+    # erreurs de classification toutes seules.
+    mots_decouverts: list[str] = []
+    if trace.certitude_lexique:
+        mots_decouverts = apprendre_cooccurrence(
+            message_humain, trace.compartiment_gagnant, force=0.6
+        )
+        memoire.sauver_stats_mots(stats_mots_actuelles())
 
-    # Génération apprise : une fois assez d'échanges accumulés, la mouche
-    # tente d'ajouter une phrase composée à partir des mots qu'elle a
-    # réellement "entendus" dans ses conversations passées (pas de modèle
-    # pré-entraîné, uniquement le vocabulaire de son propre historique).
-    corpus = memoire.charger_corpus()
-    mots_du_message = message_humain.split()
-    amorce = mots_du_message[-1] if mots_du_message else None
-    phrase_apprise = generer_phrase(corpus, mot_amorce=amorce)
-    if phrase_apprise:
-        message_mouche += f"\n🧠 (ce que ça m'évoque : « {phrase_apprise} »)"
+    historique = memoire.charger_historique()
+    corpus = [e.get("message_humain", "") for e in historique]
+    analyse = langage.analyser_message(message_humain, corpus)
+
+    rappel = None
+    if mode != "rapide":
+        rappel = langage.retrouver_echange_proche(analyse, historique)
+
+    # Suivi de conversation : revient-il sur le même sujet ? enchaîne-t-il les
+    # messages de même tonalité ? La réponse peut alors s'y référer.
+    sujets_recents = [
+        s for e in historique[-5:]
+        for s in langage.mots_de_contenu(langage.tokeniser(e.get("message_humain", "")))
+    ]
+    categories_recentes = [e.get("categorie") for e in historique[-3:]]
+
+    contexte = {
+        "rappel": rappel,
+        "reponses_recentes": [e.get("message_mouche", "") for e in historique[-6:]],
+        "sujet_repete": bool(analyse["sujet"] and analyse["sujet"] in sujets_recents),
+        "serie_categorie": (
+            trace.compartiment_gagnant
+            if len(categories_recentes) == 3
+            and all(c == trace.compartiment_gagnant for c in categories_recentes)
+            else None
+        ),
+        "voisins_semantiques": trace.voisins_semantiques,
+        "sujet_inconnu": bool(
+            analyse["sujet"] and est_totalement_inconnu(analyse["sujet"])
+        ),
+        "etat": physiologie.resumer(etat_interne),
+    }
+
+    message_mouche, nb_candidats = langage.composer_reponse(
+        analyse, trace.compartiment_gagnant, contexte, mode=mode
+    )
+
+    etat_apres = physiologie.appliquer_echange(etat_interne, trace.compartiment_gagnant)
+    memoire.sauver_etat_interne(etat_apres)
 
     kc_indices = trace.kc_indices_actifs.tolist()
     echange_id = memoire.enregistrer_echange(
@@ -149,6 +196,15 @@ def converser_avec_mouche(
         "chimie": reponse["chimie"],
         "description": reponse["description"],
         "audio_path": nom_fichier_wav,
+        "mode": mode,
+        "candidats_evalues": nb_candidats,
+        "mots_decouverts": mots_decouverts,
+        "rappel_trouve": bool(rappel),
+        "etat_interne": physiologie.resumer(etat_apres),
+        "associations": [
+            {"mot": inconnu, "proche": proche, "proximite": round(proximite, 2)}
+            for inconnu, _, proche, proximite in trace.voisins_semantiques[:3]
+        ],
     }
 
     if nom_fichier_video:

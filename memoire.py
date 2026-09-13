@@ -6,8 +6,10 @@ Trois choses sont sauvegardées sur disque (fichier JSON local) :
      le mécanisme réel de l'apprentissage associatif dans le corps pédonculé).
   2. Le lexique appris : des mots que l'utilisateur a employés et confirmés
      (via le feedback 👍/👎) comme associés à une catégorie de comportement.
-  3. Le corpus de phrases (historique) qui sert à entraîner le générateur de
-     texte par chaîne de Markov (voir texte_genere.py).
+  3. L'historique des échanges, qui sert à la fois de mémoire associative
+     (retrouver un sujet déjà abordé, voir langage.py) et de corpus de
+     vocabulaire.
+  4. Les co-occurrences mot/catégorie du classifieur bayésien (stats_mots).
 """
 
 from __future__ import annotations
@@ -32,6 +34,22 @@ _ETAT_PAR_DEFAUT = {
     "stats": {"total_echanges": 0, "total_feedback_positif": 0, "total_feedback_negatif": 0},
 }
 
+# Champs ajoutés après coup : absents des cerveaux exportés avant leur
+# introduction, donc optionnels à l'import (sinon les anciens fichiers, dont
+# la mouche principale déjà sauvegardée, deviendraient tous invalides).
+_CHAMPS_OPTIONNELS = {
+    "stats_mots": {},          # categorie -> {mot: poids de co-occurrence}
+    # État physiologique persistant : chez la vraie drosophile, la faim et la
+    # fatigue conditionnent les comportements déclenchés par un même stimulus
+    # (modulation dopaminergique des sorties du corps pédonculé).
+    "etat_interne": {
+        "faim": 0.4,
+        "energie": 1.0,
+        "humeur": 0.0,
+        "derniere_visite": None,
+    },
+}
+
 
 def _lire() -> dict:
     if not os.path.exists(CHEMIN_MEMOIRE):
@@ -52,7 +70,7 @@ def _lire() -> dict:
             donnees = json.load(f)
     except (json.JSONDecodeError, OSError):
         return json.loads(json.dumps(_ETAT_PAR_DEFAUT))
-    for cle, valeur in _ETAT_PAR_DEFAUT.items():
+    for cle, valeur in {**_ETAT_PAR_DEFAUT, **_CHAMPS_OPTIONNELS}.items():
         donnees.setdefault(cle, json.loads(json.dumps(valeur)))
     return donnees
 
@@ -73,10 +91,67 @@ def charger_poids_appris() -> dict[str, dict[int, float]]:
     }
 
 
+def charger_stats_mots() -> dict[str, dict[str, float]]:
+    with _verrou:
+        donnees = _lire()
+    return {
+        categorie: {mot: float(poids) for mot, poids in mots.items()}
+        for categorie, mots in donnees["stats_mots"].items()
+        if isinstance(mots, dict)
+    }
+
+
+def sauver_stats_mots(stats_mots: dict[str, dict[str, float]]) -> None:
+    """Persiste les co-occurrences mot/catégorie apprises automatiquement."""
+    with _verrou:
+        donnees = _lire()
+        donnees["stats_mots"] = {
+            categorie: {mot: float(poids) for mot, poids in mots.items()}
+            for categorie, mots in stats_mots.items()
+        }
+        _ecrire(donnees)
+
+
 def charger_lexique_appris() -> dict[str, dict[str, int]]:
     with _verrou:
         donnees = _lire()
     return donnees["lexique_appris"]
+
+
+def charger_etat_interne() -> dict:
+    with _verrou:
+        donnees = _lire()
+    etat = dict(_CHAMPS_OPTIONNELS["etat_interne"])
+    source = donnees.get("etat_interne")
+    if isinstance(source, dict):
+        for cle in ("faim", "energie", "humeur"):
+            try:
+                etat[cle] = float(source.get(cle, etat[cle]))
+            except (TypeError, ValueError):
+                pass
+        visite = source.get("derniere_visite")
+        etat["derniere_visite"] = visite if isinstance(visite, str) else None
+    return etat
+
+
+def sauver_etat_interne(etat: dict) -> None:
+    with _verrou:
+        donnees = _lire()
+        donnees["etat_interne"] = {
+            "faim": float(etat.get("faim", 0.4)),
+            "energie": float(etat.get("energie", 1.0)),
+            "humeur": float(etat.get("humeur", 0.0)),
+            "derniere_visite": datetime.now(timezone.utc).isoformat(),
+        }
+        _ecrire(donnees)
+
+
+def charger_historique(limite: int = 400) -> list[dict]:
+    """Derniers échanges complets, utilisés par la mémoire associative du
+    moteur de langage (retrouver un sujet déjà abordé)."""
+    with _verrou:
+        donnees = _lire()
+    return [e for e in donnees["historique"][-limite:] if isinstance(e, dict)]
 
 
 def charger_corpus() -> list[str]:
@@ -283,10 +358,29 @@ def importer_etat(donnees: dict) -> dict:
         except (TypeError, ValueError):
             continue
 
+    # stats_mots : champ optionnel (absent des cerveaux exportés avant son
+    # introduction), mêmes règles de validation que le lexique.
+    stats_mots_valides: dict[str, dict[str, float]] = {}
+    stats_mots_source = donnees.get("stats_mots")
+    if isinstance(stats_mots_source, dict):
+        for categorie, mots in stats_mots_source.items():
+            if not isinstance(categorie, str) or not isinstance(mots, dict):
+                continue
+            cible = {}
+            for mot, poids in mots.items():
+                if not isinstance(mot, str):
+                    continue
+                try:
+                    cible[mot] = float(poids)
+                except (TypeError, ValueError):
+                    continue
+            stats_mots_valides[categorie] = cible
+
     stats_source = donnees["stats"] if isinstance(donnees["stats"], dict) else {}
     etat = {
         "poids_mbon_kc": poids_valides,
         "lexique_appris": lexique_valide,
+        "stats_mots": stats_mots_valides,
         "historique": historique_valide[-2000:],
         "stats": {
             "total_echanges": _entier_positif(stats_source.get("total_echanges")),

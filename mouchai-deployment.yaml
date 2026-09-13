@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mouchai-data-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mouchai-deployment
+  labels:
+    app: mouchai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mouchai
+  template:
+    metadata:
+      labels:
+        app: mouchai
+    spec:
+      containers:
+        - name: mouchai
+          image: nycolazsec/mouchai:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 50041
+          volumeMounts:
+            - name: data-storage
+              mountPath: /app/data
+      volumes:
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: mouchai-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mouchai-service
+spec:
+  selector:
+    app: mouchai
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 50041
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mouchai-http
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`mouche.nycolazsec.com`)
+      kind: Rule
+      middlewares:
+        - name: redirect-https
+      services:
+        - name: mouchai-service
+          port: 80
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mouchai-https
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`mouche.nycolazsec.com`)
+      kind: Rule
+      services:
+        - name: mouchai-service
+          port: 80
+  tls:
+    certResolver: letsencrypt

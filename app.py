@@ -23,6 +23,7 @@ from main import (
 app = Flask(__name__)
 
 CATEGORIES_VALIDES = {"aversif", "appetitif", "courtship", "neutre"}
+MODES_VALIDES = {"rapide", "reflechi"}
 
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "static", "audio")
 VIDEO_DIR = os.path.join(os.path.dirname(__file__), "static", "videos")
@@ -47,6 +48,10 @@ def chat():
     if len(message) > 500:
         return jsonify({"erreur": "Message trop long (500 caractères max)."}), 400
 
+    mode = data.get("mode", "reflechi")
+    if mode not in MODES_VALIDES:
+        return jsonify({"erreur": "Mode invalide."}), 400
+
     identifiant = uuid.uuid4().hex
     nom_wav = f"{identifiant}.wav"
     nom_mp4 = f"{identifiant}.mp4"
@@ -54,7 +59,7 @@ def chat():
     chemin_mp4 = os.path.join(VIDEO_DIR, nom_mp4)
 
     resultat = converser_avec_mouche(
-        message, nom_fichier_wav=chemin_wav, nom_fichier_video=chemin_mp4
+        message, nom_fichier_wav=chemin_wav, nom_fichier_video=chemin_mp4, mode=mode
     )
 
     return jsonify(
@@ -65,6 +70,12 @@ def chat():
             "posture": resultat["posture"],
             "chimie": resultat["chimie"],
             "description": resultat["description"],
+            "mode": resultat["mode"],
+            "candidats_evalues": resultat["candidats_evalues"],
+            "mots_decouverts": resultat["mots_decouverts"],
+            "rappel_trouve": resultat["rappel_trouve"],
+            "etat_interne": resultat["etat_interne"],
+            "associations": resultat["associations"],
             "audio_url": f"/static/audio/{nom_wav}",
             "video_url": f"/static/videos/{nom_mp4}",
         }
@@ -174,4 +185,4 @@ def restaurer_principale():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5002)
